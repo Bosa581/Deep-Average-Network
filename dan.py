@@ -170,6 +170,8 @@ def evaluate(data_loader, model, device):
         labels = batch['labels']
 
         ####Your code here
+        with torch.no_grad():
+            logits = model(question_text, question_len)
 
         top_n, top_i = logits.topk(1)
         num_examples += question_text.size(0)
@@ -206,11 +208,15 @@ def train(args, model, train_data_loader, dev_data_loader, accuracy, device):
         labels = batch['labels']
 
         #### Your code here
-        
-
+        optimizer.zero_grad()
+        logits = model(question_text, question_len)
+        loss = criterion(logits, labels)
+        loss.backward()
         clip_grad_norm_(model.parameters(), args.grad_clipping) 
-        print_loss_total += loss.data.numpy()
-        epoch_loss_total += loss.data.numpy()
+        optimizer.step()
+        
+        print_loss_total += loss.item()
+        epoch_loss_total += loss.item()
 
         if idx % args.checkpoint == 0 and idx > 0:
             print_loss_avg = print_loss_total / args.checkpoint
@@ -218,6 +224,7 @@ def train(args, model, train_data_loader, dev_data_loader, accuracy, device):
             print('number of steps: %d, loss: %.5f time: %.5f' % (idx, print_loss_avg, time.time()- start))
             print_loss_total = 0
             curr_accuracy = evaluate(dev_data_loader, model, device)
+            model.train()
             if accuracy < curr_accuracy:
                 torch.save(model, args.save_model)
                 accuracy = curr_accuracy
@@ -257,7 +264,7 @@ class DanModel(nn.Module):
         # For test cases, the network we consider is - linear1 -> ReLU() -> Dropout(0.5) -> linear2
 
         #### Your code here
-        
+        self.network = nn.Sequential(self.linear1,nn.ReLU(),nn.Dropout(self.nn_dropout), self.linear2)
         
        
     def forward(self, input_text, text_len, is_prob=False):
@@ -269,20 +276,22 @@ class DanModel(nn.Module):
         text_len : batch * 1, text length for each question
         is_prob: if True, output the softmax of last layer
         """
-
-        logits = torch.LongTensor([0.0] * self.n_classes)
-
         # Complete the forward funtion.  First look up the word embeddings.
-        
+        word_embeddings = self.embeddings(input_text)
         # Then average them 
-        
+        summed_embeddings = word_embeddings.sum(dim=1)
+        average_embeddings = summed_embeddings/text_len.unsqueeze(1)
+                
         # Before feeding them through the network
-        
+        logits = self.network(average_embeddings)
 
         if is_prob:
             logits = self._softmax(logits)
 
         return logits
+
+    def _softmax(self,logits):
+       return torch.softmax(logits,dim=1)
 
 
 
