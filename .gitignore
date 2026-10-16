@@ -1,2 +1,16 @@
 COMP5420_AST4_DANs.pdf
 data/qanta.train.json
+
+# Python environments and generated files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local reports, archives, previews, and training artifacts
+report.*
+*.zip
+tmp/
+tmp_*.pt
+training*.log
+q_type_new.pt

@@ -1,3 +1,4 @@
+#Orobosa Igbinovia
 import argparse
 import torch
 import torch.nn as nn
@@ -8,9 +9,31 @@ from torch.nn.utils import clip_grad_norm_
 import json
 import time
 import nltk
+import os
+import tempfile
 
 kUNK = '<unk>'
 kPAD = '<pad>'
+
+
+def save_checkpoint(model, filename):
+    directory = os.path.dirname(os.path.abspath(filename))
+    with tempfile.NamedTemporaryFile(dir=directory, suffix='.pt', delete=False) as output:
+        temporary_path = output.name
+    try:
+        torch.save(model, temporary_path)
+        # Windows sync clients can briefly lock an existing checkpoint.
+        for attempt in range(8):
+            try:
+                os.replace(temporary_path, filename)
+                break
+            except PermissionError:
+                if attempt == 7:
+                    raise
+                time.sleep(0.25 * (attempt + 1))
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
 
 # You don't need to change this funtion
 def class_labels(data):
@@ -152,7 +175,8 @@ def batchify(batch):
     return q_batch
 
 
-def evaluate(data_loader, model, device):
+def evaluate(data_loader, model, device, examples=None, ind2class=None,
+             max_errors=0):
     """
     evaluate the current model, get the accuracy for dev/test set
     Keyword arguments:
@@ -164,24 +188,39 @@ def evaluate(data_loader, model, device):
     model.eval()
     num_examples = 0
     error = 0
+    printed_errors = 0
     for idx, batch in enumerate(data_loader):
         question_text = batch['text'].to(device)
-        question_len = batch['len']
-        labels = batch['labels']
+        question_len = batch['len'].to(device)
+        labels = batch['labels'].to(device)
 
         ####Your code here
         with torch.no_grad():
             logits = model(question_text, question_len)
 
-        top_n, top_i = logits.topk(1)
+        predictions = logits.argmax(dim=1)
+        wrong_indices = (predictions != labels).nonzero(as_tuple=True)[0]
+        # Original examples must follow the loader's sequential order.
+        if examples is not None and ind2class is not None:
+            for i in wrong_indices.tolist():
+                if printed_errors >= max_errors:
+                    break
+                tokens, true_label = examples[num_examples + i]
+                predicted_label = ind2class[predictions[i].item()]
+                print('\nMisclassified question %d:' % (num_examples + i + 1))
+                print('Question:', ' '.join(tokens))
+                print('True category:', true_label)
+                print('Predicted category:', predicted_label)
+                printed_errors += 1
         num_examples += question_text.size(0)
-        error += torch.nonzero(top_i.squeeze() - torch.LongTensor(labels)).size(0)
+        error += wrong_indices.numel()
     accuracy = 1 - error / num_examples
     print('accuracy', accuracy)
     return accuracy
 
 
-def train(args, model, train_data_loader, dev_data_loader, accuracy, device):
+def train(args, model, train_data_loader, dev_data_loader, accuracy, device,
+          optimizer=None):
     """
     Train the current model
     Keyword arguments:
@@ -194,7 +233,8 @@ def train(args, model, train_data_loader, dev_data_loader, accuracy, device):
     """
 
     model.train()
-    optimizer = torch.optim.Adamax(model.parameters())
+    if optimizer is None:
+        optimizer = torch.optim.Adamax(model.parameters())
     criterion = nn.CrossEntropyLoss()
     print_loss_total = 0
     epoch_loss_total = 0
@@ -204,8 +244,8 @@ def train(args, model, train_data_loader, dev_data_loader, accuracy, device):
 
     for idx, batch in enumerate(train_data_loader):
         question_text = batch['text'].to(device)
-        question_len = batch['len']
-        labels = batch['labels']
+        question_len = batch['len'].to(device)
+        labels = batch['labels'].to(device)
 
         #### Your code here
         optimizer.zero_grad()
@@ -226,8 +266,12 @@ def train(args, model, train_data_loader, dev_data_loader, accuracy, device):
             curr_accuracy = evaluate(dev_data_loader, model, device)
             model.train()
             if accuracy < curr_accuracy:
-                torch.save(model, args.save_model)
+                save_checkpoint(model, args.save_model)
                 accuracy = curr_accuracy
+    curr_accuracy = evaluate(dev_data_loader, model, device)
+    if accuracy < curr_accuracy:
+        save_checkpoint(model, args.save_model)
+        accuracy = curr_accuracy
     return accuracy
 
 
@@ -300,7 +344,7 @@ class DanModel(nn.Module):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Question Type')
-    parser.add_argument('--no-cuda', action='store_true', default=True)
+    parser.add_argument('--no-cuda', action='store_true', default=False)
     parser.add_argument('--train-file', type=str, default='data/qanta.train.json')
     parser.add_argument('--dev-file', type=str, default='data/qanta.dev.json')
     parser.add_argument('--test-file', type=str, default='data/qanta.test.json')
@@ -309,6 +353,12 @@ if __name__ == "__main__":
     parser.add_argument('--grad-clipping', type=int, default=5)
     parser.add_argument('--resume', action='store_true', default=False)
     parser.add_argument('--test', action='store_true', default=False)
+    parser.add_argument('--train-eval', action='store_true',
+                        help='Evaluate a saved model on training data without retraining')
+    parser.add_argument('--dev-errors', action='store_true',
+                        help='Evaluate a saved model on dev and print incorrect predictions')
+    parser.add_argument('--max-errors', type=int, default=10,
+                        help='Maximum number of evaluation errors to print')
     parser.add_argument('--save-model', type=str, default='q_type.pt')
     parser.add_argument('--load-model', type=str, default='q_type.pt')
     parser.add_argument("--limit", help="Number of training documents", type=int, default=-1, required=False)
@@ -335,22 +385,53 @@ if __name__ == "__main__":
     #get class to int mapping
     class2ind, ind2class = class_labels(train_exs + dev_exs)  
 
-    if args.test:
-        model = torch.load(args.load_model)
+    saved_model = None
+    if args.train_eval or args.dev_errors or args.test or args.resume:
+        saved_model = torch.load(args.load_model, map_location=device, weights_only=False)
+        saved_model.to(device)
+        if hasattr(saved_model, 'word2ind'):
+            word2ind = saved_model.word2ind
+            class2ind = saved_model.class2ind
+            ind2class = {i: label for label, i in class2ind.items()}
+            num_classes = saved_model.n_classes
+
+    if args.train_eval:
+        model = saved_model
+        model.to(device)
+        train_dataset = QuestionDataset(train_exs, word2ind, num_classes, class2ind)
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=0, collate_fn=batchify)
+        evaluate(train_loader, model, device)
+    elif args.dev_errors:
+        model = saved_model
+        model.to(device)
+        dev_dataset = QuestionDataset(dev_exs, word2ind, num_classes, class2ind)
+        dev_loader = torch.utils.data.DataLoader(
+            dev_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=0, collate_fn=batchify)
+        evaluate(dev_loader, model, device, examples=dev_exs,
+                 ind2class=ind2class, max_errors=args.max_errors)
+    elif args.test:
+        model = saved_model
+        model.to(device)
         #### Load batchifed dataset
         test_dataset = QuestionDataset(test_exs, word2ind, num_classes, class2ind)
         test_sampler = torch.utils.data.sampler.SequentialSampler(test_dataset)
         test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size,
                                                sampler=test_sampler, num_workers=0,
                                                collate_fn=batchify)
-        evaluate(test_loader, model, device)
+        evaluate(test_loader, model, device, examples=test_exs,
+                 ind2class=ind2class, max_errors=args.max_errors)
     else:
         if args.resume:
-            model = torch.load(args.load_model)
+            model = saved_model
         else:
             model = DanModel(num_classes, len(voc))
             model.to(device)
         print(model)
+        model.word2ind = word2ind
+        model.class2ind = class2ind
         #### Load batchifed dataset
         train_dataset = QuestionDataset(train_exs, word2ind, num_classes, class2ind)
         train_sampler = torch.utils.data.sampler.RandomSampler(train_dataset)
@@ -361,13 +442,26 @@ if __name__ == "__main__":
                                                sampler=dev_sampler, num_workers=0,
                                                collate_fn=batchify)
         accuracy = 0
+        optimizer = torch.optim.Adamax(model.parameters())
         for epoch in range(args.num_epochs):
             print('start epoch %d' % epoch)
             train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size,
                                                sampler=train_sampler, num_workers=0,
                                                collate_fn=batchify)
-            accuracy = train(args, model, train_loader, dev_loader, accuracy, device)
+            accuracy = train(args, model, train_loader, dev_loader, accuracy, device,
+                             optimizer=optimizer)
         print('start testing:\n')
+        # Report every split using the same best development checkpoint.
+        model = torch.load(args.save_model, map_location=device, weights_only=False)
+        model.to(device)
+        print('Training set:')
+        train_eval_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=0, collate_fn=batchify)
+        evaluate(train_eval_loader, model, device)
+        print('Development set:')
+        evaluate(dev_loader, model, device)
+        print('Test set:')
 
         test_dataset = QuestionDataset(test_exs, word2ind, num_classes, class2ind)
         test_sampler = torch.utils.data.sampler.SequentialSampler(test_dataset)
